@@ -172,6 +172,17 @@ class ModelLoader:
     final_norm: str = None
     lm_head: str = None
 
+    mamba_dt_bias: str = None
+    mamba_A_log: str = None
+    mamba_D: str = None
+    mamba_conv1d_weight: str = None
+    mamba_conv1d_bias: str = None
+    mamba_in_proj_weight: str = None
+    mamba_in_proj_bias: str = None
+    mamba_norm_weight: str = None
+    mamba_out_proj_weight: str = None
+    mamba_out_proj_bias: str = None
+
   def __init__(
       self,
       file_name: str,
@@ -255,6 +266,7 @@ class ModelLoader:
       self._map_norm(i, model.config, state, converted_state)
       self._map_feedforward(i, model.config, state, converted_state)
       self._map_attention(i, model.config, state, converted_state)
+      self._map_mamba(i, model.config, state, converted_state)
 
     if strict and state:
       raise ValueError(
@@ -370,6 +382,8 @@ class ModelLoader:
   ):
     prefix = f"transformer_blocks.{idx}"
     attn_config = config.block_config(idx).attn_config
+    if attn_config is None:
+      return
     if self._names.attn_fused_qkv_proj:
       fused_qkv_name = self._names.attn_fused_qkv_proj.format(idx)
       converted_state[f"{prefix}.atten_func.qkv_projection.weight"] = state.pop(
@@ -466,3 +480,86 @@ class ModelLoader:
       return torch.cat(cycled)
     else:
       return torch.cat([q, k, v], dim=0)
+
+  def _map_mamba(
+      self,
+      idx: int,
+      config: model_config.ModelConfig,
+      state: Dict[str, torch.Tensor],
+      converted_state: Dict[str, torch.Tensor],
+  ):
+    """Map Mamba layer weights from checkpoint to model structure."""
+    prefix = f"transformer_blocks.{idx}"
+    block_config = config.block_config(idx)
+    
+    # Only process if this block has a mamba config
+    if not hasattr(block_config, 'mamba_config') or block_config.mamba_config is None:
+      return
+    
+    mamba_config = block_config.mamba_config
+    
+    # Map conv1d weights
+    if self._names.mamba_conv1d_weight is not None:
+      conv1d_weight_name = self._names.mamba_conv1d_weight.format(idx)
+      converted_state[f"{prefix}.mamba_func.conv1d.weight"] = state.pop(
+          f"{conv1d_weight_name}"
+      )
+      
+    if self._names.mamba_conv1d_bias is not None and mamba_config.conv_bias:
+      conv1d_bias_name = self._names.mamba_conv1d_bias.format(idx)
+      converted_state[f"{prefix}.mamba_func.conv1d.bias"] = state.pop(
+          f"{conv1d_bias_name}"
+      )
+    
+    # Map input projection
+    if self._names.mamba_in_proj_weight is not None:
+      in_proj_weight_name = self._names.mamba_in_proj_weight.format(idx)
+      converted_state[f"{prefix}.mamba_func.in_proj.weight"] = state.pop(
+          f"{in_proj_weight_name}"
+      )
+      
+    if self._names.mamba_in_proj_bias is not None and mamba_config.proj_bias:
+      in_proj_bias_name = self._names.mamba_in_proj_bias.format(idx)
+      converted_state[f"{prefix}.mamba_func.in_proj.bias"] = state.pop(
+          f"{in_proj_bias_name}"
+      )
+    
+    # Map time step bias
+    if self._names.mamba_dt_bias is not None:
+      dt_bias_name = self._names.mamba_dt_bias.format(idx)
+      converted_state[f"{prefix}.mamba_func.dt_bias"] = state.pop(
+          f"{dt_bias_name}"
+      )
+    
+    # Map state space parameters
+    if self._names.mamba_A_log is not None:
+      A_log_name = self._names.mamba_A_log.format(idx)
+      converted_state[f"{prefix}.mamba_func.A_log"] = state.pop(
+          f"{A_log_name}"
+      )
+      
+    if self._names.mamba_D is not None:
+      D_name = self._names.mamba_D.format(idx)
+      converted_state[f"{prefix}.mamba_func.D"] = state.pop(
+          f"{D_name}"
+      )
+    
+    # Map normalization weights
+    if self._names.mamba_norm_weight is not None:
+      norm_weight_name = self._names.mamba_norm_weight.format(idx)
+      converted_state[f"{prefix}.mamba_func.norm.weight"] = state.pop(
+          f"{norm_weight_name}"
+      )
+    
+    # Map output projection
+    if self._names.mamba_out_proj_weight is not None:
+      out_proj_weight_name = self._names.mamba_out_proj_weight.format(idx)
+      converted_state[f"{prefix}.mamba_func.out_proj.weight"] = state.pop(
+          f"{out_proj_weight_name}"
+      )
+      
+    if self._names.mamba_out_proj_bias is not None and mamba_config.proj_bias:
+      out_proj_bias_name = self._names.mamba_out_proj_bias.format(idx)
+      converted_state[f"{prefix}.mamba_func.out_proj.bias"] = state.pop(
+          f"{out_proj_bias_name}"
+      )

@@ -126,6 +126,18 @@ class KVCache:
     Returns:
         KVCache: The created cache object.
     """
+    if isinstance(config.block_configs, list):
+      # Count number of blocks with non-None attn_config
+      layer_indices = [
+          idx
+          for idx, block_cfg in enumerate(config.block_configs)
+          if block_cfg.attn_config is not None
+      ]
+    elif isinstance(config.block_configs, model_config.TransformerBlockConfig):
+      if config.block_configs.attn_config is None:
+        return None
+      layer_indices = list(range(config.num_layers))
+
     caches = [
         KVCacheEntry.from_model_config(
             kv_cache_max
@@ -137,7 +149,7 @@ class KVCache:
             batch_size,
             kv_layout,
         )
-        for idx in range(config.num_layers)
+        for idx in layer_indices
     ]
     obj = cls(caches=tuple(caches))
     return obj

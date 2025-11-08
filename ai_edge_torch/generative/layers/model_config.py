@@ -151,6 +151,29 @@ class AttentionConfig:
   # The update strategy of the KV cache. Default to INPLACE.
   kvcache_update_strategy: KVCacheUpdateStrategy = KVCacheUpdateStrategy.INPLACE
 
+  attention_scale: Optional[float] = None
+
+
+@dataclasses.dataclass
+class MambaConfig:
+  """Mamba V2 parameters."""
+
+  hidden_size: int
+  chunk_size: int
+  d_conv : int
+  d_head: int
+  d_state: int
+  expand: int
+  n_groups: int
+  n_heads: int
+
+  conv_bias: bool = True
+  proj_bias: bool = False
+
+  norm_config: NormalizationConfig = dataclasses.field(
+      default_factory=NormalizationConfig
+  )
+
 
 @dataclasses.dataclass
 class ActivationConfig:
@@ -185,8 +208,11 @@ class FeedForwardConfig:
 class TransformerBlockConfig:
   """TransformerBlock module's parameters."""
 
-  attn_config: AttentionConfig
   ff_config: FeedForwardConfig
+
+  attn_config: Optional[AttentionConfig] = None
+  mamba_config: Optional[MambaConfig] = None
+
   # The normalization applied to attention's input.
   pre_attention_norm_config: NormalizationConfig = dataclasses.field(
       default_factory=NormalizationConfig
@@ -205,6 +231,18 @@ class TransformerBlockConfig:
   # KV Cache length for this block. Only used when attention types are different
   # across blocks
   kv_cache_max_len: Optional[int] = None
+
+  residual_multiplier: float = 1.0
+
+  def __post_init__(self):
+    if self.attn_config is None and self.mamba_config is None:
+      raise ValueError(
+          "Either attn_config or mamba_config must be provided."
+      )
+    elif self.attn_config is not None and self.mamba_config is not None:
+      raise ValueError(
+          "Only one of attn_config or mamba_config can be provided."
+      )
 
 
 @dataclasses.dataclass
@@ -258,10 +296,13 @@ class ModelConfig:
 
   # Softcap on the model output logits.
   final_logit_softcap: Optional[float] = None
+  final_logit_scaling: Optional[float] = None
 
   # The function to call to create the RoPE sin and cos vectors during the
   # forward pass. Defaults to a standard implementation.
   build_rope: Callable = rotary_position_embedding.build_rope
+
+  embedding_padding_idx: int = 0
 
   # An interleaved sequence of the attention types used in the model.
   # E.g. [AttentionType.LOCAL_SLIDING, AttentionType.LOCAL_SLIDING,

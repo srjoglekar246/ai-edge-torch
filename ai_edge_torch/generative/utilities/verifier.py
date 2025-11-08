@@ -19,6 +19,7 @@ import logging
 from typing import Any, List, Optional
 
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
+from ai_edge_torch.generative.layers import mamba_cache as mamba_utils
 from ai_edge_torch.generative.utilities import export_config
 import torch
 
@@ -126,9 +127,11 @@ class ReauthoredModelWrapper(ModelWrapper):
   def _forward_with_kv_cache(
       self,
       tokens: torch.Tensor,
+      actual_tokens_len: int,
       input_pos: torch.Tensor,
       kv_cache: kv_utils.KVCache,
       pixel_values: torch.Tensor,
+      mamba_cache: mamba_utils.MambaCache = None,
   ) -> tuple[torch.Tensor, kv_utils.KVCache]:
     """Forwards the model and updates an external KV cache.
 
@@ -151,17 +154,25 @@ class ReauthoredModelWrapper(ModelWrapper):
       extra_args["pixel_values"] = pixel_values
     if self.mask_as_input:
       extra_args["mask"] = self._build_mask(input_pos)
+    # Create mamba mask with same shape as tokens, but with the first actual_tokens_len elements set to 1, rest 0.
+    extra_args["mamba_mask"] = torch.zeros_like(tokens).masked_fill(
+        torch.arange(tokens.shape[1]) < actual_tokens_len, 1
+    )
+    extra_args["mamba_cache"] = mamba_cache
     output = self.model.forward(tokens, input_pos, kv_cache, **extra_args)
-    return output["logits"], output["kv_cache"]
+    return output
 
   def forward(
-      self, tokens: torch.Tensor, pixel_values: torch.Tensor = None
+      self, tokens: torch.Tensor, pixel_values: torch.Tensor = None, actual_tokens_len: Optional[int] = None, 
   ) -> torch.Tensor:
     input_pos = torch.arange(0, tokens.shape[1], dtype=torch.int)
-    logits, _ = self._forward_with_kv_cache(
-        tokens, input_pos, self._init_kv_cache(), pixel_values
+    if actual_tokens_len is None:
+      actual_tokens_len = tokens.shape[1]
+    outputs = self._forward_with_kv_cache(
+        tokens, actual_tokens_len, input_pos, self._init_kv_cache(), pixel_values,
+        mamba_cache=mamba_utils.MambaCache.from_model_config(self.model.config)
     )
-    return logits
+    return outputs["logits"]
 
   def generate(
       self,
@@ -171,18 +182,24 @@ class ReauthoredModelWrapper(ModelWrapper):
       eos_token_id: Optional[int] = None,
   ) -> torch.IntTensor:
     input_ids = prompts[0].int().tolist()
+    tokens_len = len(input_ids)
     tokens = torch.tensor([input_ids])
     input_pos = torch.arange(0, tokens.shape[1], dtype=torch.int)
     kv_cache = self._init_kv_cache()
+    mamba_cache = mamba_utils.MambaCache.from_model_config(self.model.config)
     for _ in range(max_new_tokens):
-      logits, kv_cache = self._forward_with_kv_cache(
-          tokens, input_pos, kv_cache, pixel_values
+      outputs = self._forward_with_kv_cache(
+          tokens, tokens_len, input_pos, kv_cache, pixel_values, mamba_cache=mamba_cache
       )
+      logits = outputs["logits"]
+      kv_cache = outputs.get("kv_cache", kv_cache)
+      mamba_cache = outputs.get("mamba_cache", mamba_cache)
       generated_token = logits[0][-1].argmax().item()
       input_ids.append(generated_token)
       if eos_token_id is not None and generated_token == eos_token_id:
         break
       tokens = torch.tensor([[generated_token]])
+      tokens_len = 1
       input_pos = torch.tensor([len(input_ids) - 1])
       pixel_values = None  # Pass only for the first time.
     return torch.tensor([input_ids])
@@ -243,7 +260,7 @@ def verify_with_input_ids(
   logging.info("logits_original: %s", logits_original)
 
   logging.info("Forwarding the reauthored model...")
-  outputs_reauthored = reauthored_model.forward(tokens)
+  outputs_reauthored = reauthored_model.forward(tokens, actual_tokens_len=len(input_ids))
   logits_reauthored = outputs_reauthored[0, len(input_ids) - 1, :]
   logging.info("logits_reauthored: %s", logits_reauthored)
 
@@ -358,21 +375,26 @@ def verify_reauthored_model(
       else:
         logging.info("*** PASSED *** verify with input IDs: %s", input_ids)
 
-  if verify_prompts:
-    for prompts in generate_prompts:
-      logging.info("Verifying the reauthored model with prompts: %s", prompts)
-      try:
-        verify_model_with_prompts(
-            original_model, reauthored_model, tokenizer, prompts, max_new_tokens
-        )
-      except AssertionError as e:
-        logging.error("*** FAILED *** verify with prompts: %s", prompts)
-        logging.error("*** Assertion Error: %s", e)
-        failure_count += 1
-        if not continue_on_failure:
-          return False
-      else:
-        logging.info("*** PASSED *** verify with prompts: %s", prompts)
+  # if verify_prompts:
+  #   for prompts in generate_prompts:
+  #     logging.info("Verifying the reauthored model with prompts: %s", prompts)
+  #     try:
+  #       verify_model_with_prompts(
+  #           original_model, reauthored_model, tokenizer, prompts, max_new_tokens
+  #       )
+  #     except AssertionError as e:
+  #       logging.error("*** FAILED *** verify with prompts: %s", prompts)
+  #       logging.error("*** Assertion Error: %s", e)
+  #       failure_count += 1
+  #       if not continue_on_failure:
+  #         return False
+  #     else:
+  #       logging.info("*** PASSED *** verify with prompts: %s", prompts)
+
+  for prompts in generate_prompts:
+    verify_model_with_prompts(
+        original_model, reauthored_model, tokenizer, prompts, max_new_tokens
+    )
 
   if failure_count == 0:
     logging.info("*** PASSED *** verify_reauthored_model")

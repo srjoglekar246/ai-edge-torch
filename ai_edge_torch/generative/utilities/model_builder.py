@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 from ai_edge_torch.generative.layers import attention
 from ai_edge_torch.generative.layers import builder
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
+from ai_edge_torch.generative.layers import mamba_cache as mamba_utils
 from ai_edge_torch.generative.layers import lora as lora_utils
 import ai_edge_torch.generative.layers.attention_utils as attn_utils
 import ai_edge_torch.generative.layers.model_config as cfg
@@ -64,7 +65,7 @@ class DecoderOnlyModel(nn.Module):
 
     # Construct model layers.
     self.tok_embedding = nn.Embedding(
-        config.vocab_size, config.embedding_dim, padding_idx=0
+        config.vocab_size, config.embedding_dim, padding_idx=config.embedding_padding_idx
     )
     self.lm_head = nn.Linear(
         config.embedding_dim, config.vocab_size, bias=config.lm_head_use_bias
@@ -89,16 +90,40 @@ class DecoderOnlyModel(nn.Module):
       self.mask_cache = None
     else:
       self.mask_cache = attn_utils.build_causal_mask_cache(mask_cache_size)
+    
+  def first_attn_block(self) -> Optional[attention.TransformerBlock]:
+    """Returns the first attention block."""
+    for block in self.transformer_blocks:
+      if block.atten_func is not None:
+        return block
+    return None
+  
+  def num_atten_blocks(self) -> int:
+    """Returns the number of attention blocks."""
+    count = 0
+    for block in self.transformer_blocks:
+      if block.atten_func is not None:
+        count += 1
+    return count
+  
+  def has_mamba_blocks(self) -> bool:
+    """Returns whether the model has any Mamba blocks."""
+    for block in self.transformer_blocks:
+      if block.mamba_func is not None:
+        return True
+    return False
 
   @torch.inference_mode
   def forward(
       self,
       tokens: torch.Tensor,
       input_pos: torch.Tensor,
-      kv_cache: kv_utils.KVCache,
+      kv_cache: kv_utils.KVCache = None,
       mask: Optional[torch.Tensor] = None,
       lora: Optional[lora_utils.LoRA] = None,
       export_config: Optional[export_cfg.ExportConfig] = None,
+      mamba_cache: mamba_utils.MambaCache = None,
+      mamba_mask: Optional[torch.Tensor] = None,
   ) -> dict[torch.Tensor, kv_utils.KVCache]:
     _, seq_len = tokens.size()
     assert self.config.max_seq_len >= seq_len, (
@@ -110,9 +135,13 @@ class DecoderOnlyModel(nn.Module):
     input_embeds = self.tok_embedding(tokens)
 
     # ROPE parameters for all attn_configs are the same. Take the first one.
-    attn_config = self.config.block_config(0).attn_config
-    n_elem = int(attn_config.rotary_percentage * attn_config.head_dim)
-    rope = self.config.build_rope(input_pos, n_elem, attn_config.rotary_base)
+    first_attn_block = self.first_attn_block()
+    n_elem = 0
+    rope = None
+    if first_attn_block is not None:
+      attn_config = first_attn_block.config.attn_config
+      n_elem = int(attn_config.rotary_percentage * attn_config.head_dim)
+      rope = self.config.build_rope(input_pos, n_elem, attn_config.rotary_base)
 
     if mask is None:
       assert self.mask_cache is not None, "Mask cache must be built."
@@ -121,22 +150,24 @@ class DecoderOnlyModel(nn.Module):
       mask = mask[:, :, :, :kv_cache.get_max_seq_len()]
 
     return self._forward_with_embeds(
-        input_embeds, rope, mask, input_pos, kv_cache, lora, export_config
+        input_embeds, rope, mask, input_pos, kv_cache, lora, export_config, mamba_cache, mamba_mask
     )
 
   def _forward_with_embeds(
       self,
       input_embeds: torch.Tensor,
-      rope: Tuple[torch.Tensor, torch.Tensor],
+      rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
       mask: torch.Tensor,
-      input_pos: torch.Tensor,
-      kv_cache: kv_utils.KVCache,
+      input_pos: Optional[torch.Tensor],
+      kv_cache: kv_utils.KVCache = None,
       lora: Optional[lora_utils.LoRA] = None,
       export_config: Optional[export_cfg.ExportConfig] = None,
+      mamba_cache: mamba_utils.MambaCache = None,
+      mamba_mask: Optional[torch.Tensor] = None,
   ) -> dict[torch.Tensor, kv_utils.KVCache]:
     """Forwards the model with input embeddings."""
-    assert len(self.transformer_blocks) == len(kv_cache.caches), (
-        "The number of transformer blocks and the number of KV cache entries"
+    assert self.num_atten_blocks() == len(kv_cache.caches), (
+        "The number of transformer attention blocks and the number of KV cache entries"
         " must be the same."
     )
 
@@ -144,25 +175,51 @@ class DecoderOnlyModel(nn.Module):
     if self.config.embedding_scale is not None:
       x = x * self.config.embedding_scale
 
+    # TODO(srjoglekar): Combine kv_cache and mamba_cache into a single cache?
     updated_kv_entries = []
+    updated_mamba_entries = []
+    kv_layer_idx = 0
+    mamba_layer_idx = 0
+    updated_kv_cache = None
+    updated_mamba_cache = None
     for i, block in enumerate(self.transformer_blocks):
-      kv_entry = kv_cache.caches[i] if kv_cache else None
-      lora_adapter = lora.adapters[i] if lora else None
-      x, kv_entry = block(x, rope, mask, input_pos, kv_entry, lora_adapter)
-      if kv_entry:
-        updated_kv_entries.append(kv_entry)
-    updated_kv_cache = kv_utils.KVCache(tuple(updated_kv_entries))
+      if block.atten_func is not None:
+        kv_entry = kv_cache.caches[kv_layer_idx] if kv_cache else None
+        lora_adapter = lora.adapters[i] if lora else None
+        x, kv_entry = block(x, rope, mask, input_pos, kv_entry, lora_adapter)
+        if kv_entry:
+          updated_kv_entries.append(kv_entry)
+        kv_layer_idx += 1
+      elif block.mamba_func is not None:
+        mamba_entry = mamba_cache.caches[mamba_layer_idx] if mamba_cache else None
+        lora_adapter = lora.adapters[i] if lora else None
+        x, mamba_entry = block(
+            x, rope=None, mask=mask, input_pos=input_pos, kv_cache=None,
+            lora=lora_adapter, mamba_cache=mamba_entry, mamba_mask=mamba_mask
+        )
+        if mamba_entry:
+          updated_mamba_entries.append(mamba_entry)
+        mamba_layer_idx += 1
+    cache_out_dir = {}
+    if len(updated_kv_entries) > 0:
+      updated_kv_cache = kv_utils.KVCache(tuple(updated_kv_entries))
+      cache_out_dir["kv_cache"] = updated_kv_cache
+    if len(updated_mamba_entries) > 0:
+      updated_mamba_cache = mamba_utils.MambaCache(tuple(updated_mamba_entries))
+      cache_out_dir["mamba_cache"] = updated_mamba_cache
 
     if export_config is not None:
       if (
           torch.numel(input_pos) > 1
           and not export_config.output_logits_on_prefill
       ):
-        return {"kv_cache": updated_kv_cache}
+        return cache_out_dir
 
     x = self.final_norm(x)
     logits = self.lm_head(x)  # (b, t, vocab_size)
-    return {"logits": logits, "kv_cache": updated_kv_cache}
+    if self.config.final_logit_scaling:
+      logits = logits / self.config.final_logit_scaling
+    return {"logits": logits, **cache_out_dir}
 
 
 def build_decoder_only_model(

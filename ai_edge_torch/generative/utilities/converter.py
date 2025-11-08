@@ -23,6 +23,7 @@ from typing import Callable, Dict, Optional, Union
 from absl import flags
 from ai_edge_torch._convert import converter as converter_utils
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
+from ai_edge_torch.generative.layers import mamba_cache as mamba_utils
 from ai_edge_torch.generative.layers import lora as lora_utils
 import ai_edge_torch.generative.layers.model_config as cfg
 from ai_edge_torch.generative.quantize import quant_attrs
@@ -474,6 +475,19 @@ def _add_signatures(
       kv_layout=export_config.kvcache_layout,
   )
 
+  prefill_mamba_cache = None
+  decode_mamba_cache = None
+  if pytorch_model.has_mamba_blocks():
+    prefill_mamba_cache = mamba_utils.MambaCache.from_model_config(config)
+    decode_mamba_cache = mamba_utils.MambaCache.from_model_config(
+        config, batch_size=export_config.decode_batch_size
+    )
+  
+  def _maybe_add_mamba_to_kwargs(sample_kwargs: Dict, is_prefill: bool = False):
+    cache = prefill_mamba_cache if is_prefill else decode_mamba_cache
+    if cache is not None:
+      sample_kwargs['mamba_cache'] = cache
+
   # For export, we create a module that captures any non-exportable,
   # arugments, e.g. the generation config object.
   mod = ExportableModule(pytorch_model, export_config=export_config).eval()
@@ -488,6 +502,7 @@ def _add_signatures(
           'input_pos': prefill_input_pos_list[i],
           'kv_cache': prefill_kv,
       }
+      _maybe_add_mamba_to_kwargs(sample_kwargs, is_prefill=True)
       if prefill_masks is not None:
         sample_kwargs['mask'] = prefill_masks[i]
 
@@ -508,6 +523,7 @@ def _add_signatures(
             'kv_cache': prefill_kv,
             'pixel_values': prefill_pixel_values,
         }
+        _maybe_add_mamba_to_kwargs(sample_pixel_kwargs, is_prefill=True)
         # mask should be built internally when pixel values are passed.
         if lora is not None:
           sample_pixel_kwargs['lora'] = lora
@@ -522,6 +538,7 @@ def _add_signatures(
         'input_pos': decode_input_pos,
         'kv_cache': decode_kv,
     }
+    _maybe_add_mamba_to_kwargs(sample_kwargs)
     if export_config.mask_as_input:
       # Note that the decode mask is not a correct causal mask, but it is okay
       # for the conversion purpose because only the shape matters in conversion.

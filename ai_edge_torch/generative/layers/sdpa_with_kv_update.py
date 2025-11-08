@@ -80,6 +80,7 @@ def _sdpa_with_kv_update_transposed(
       mask=mask,
       softcap=config.logit_softcap,
       alibi_bias=alibi_bias,
+      scale=config.attention_scale,
   )  # 1, bk, gt, h
   sdpa_out = (
       sdpa_out.reshape(b, -1, seq_len, h)
@@ -117,6 +118,7 @@ def _sdpa_with_kv_update_default(
       mask=mask,
       softcap=config.logit_softcap,
       alibi_bias=alibi_bias,
+      scale=config.attention_scale,
   )
   sdpa_out = sdpa_out.reshape(b, seq_len, -1)
   return sdpa_out, kv
