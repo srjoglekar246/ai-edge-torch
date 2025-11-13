@@ -23,6 +23,8 @@ class LiteRTLlmPipeline:
     self._prefill_runner = None
     self._decode_runner = self._interpreter.get_signature_runner("decode")
 
+    self._needs_mamba_mask = False
+
   def _init_prefill_runner(self, num_input_tokens: int):
     """Initializes all the variables related to the prefill runner.
 
@@ -86,6 +88,7 @@ class LiteRTLlmPipeline:
       input_pos = self._interpreter.get_signature_runner(
           key
       ).get_input_details()["input_pos"]
+      self._needs_mamba_mask = "mamba_mask" in self._interpreter.get_signature_runner(key).get_input_details()
       # input_pos["shape"] has shape (max_seq_len, )
       seq_size = input_pos["shape"][0]
       max_prefill_len = max(max_prefill_len, seq_size)
@@ -134,6 +137,10 @@ class LiteRTLlmPipeline:
         "tokens": input_token_ids,
         "input_pos": input_pos,
     })
+    if self._needs_mamba_mask:
+      mamba_mask = np.zeros((1, self._max_seq_len), dtype=np.float32)
+      mamba_mask[0, :prefill_token_length] = 1.0
+      prefill_inputs["mamba_mask"] = mamba_mask
     prefill_outputs = self._prefill_runner(**prefill_inputs)
     if "logits" in prefill_outputs:
       # Prefill outputs includes logits and kv cache. We only output kv cache.
@@ -212,6 +219,10 @@ class LiteRTLlmPipeline:
           "tokens": np.array([[next_token]], dtype=np.int32),
           "input_pos": np.array([next_pos], dtype=np.int32),
       })
+      if self._needs_mamba_mask:
+        mamba_mask = np.zeros((1, 1), dtype=np.float32)
+        mamba_mask[0, 0] = 1.0
+        decode_inputs["mamba_mask"] = mamba_mask
       decode_outputs = self._decode_runner(**decode_inputs)
 
       step_end_time = time.time()

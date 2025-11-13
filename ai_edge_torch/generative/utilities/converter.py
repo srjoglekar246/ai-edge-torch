@@ -271,6 +271,17 @@ def _build_mask(mask_len, kv_cache_max_len, causal_mask_value) -> torch.Tensor:
   return torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
 
 
+def _build_mamba_mask(mask_len) -> torch.Tensor:
+  if isinstance(mask_len, list):
+    return [
+        _build_mamba_mask(i) for i in mask_len
+    ]
+  mask = torch.full(
+      (1, mask_len), 1.0, dtype=torch.float32
+  )
+  return mask
+
+
 def convert_to_tflite(
     pytorch_model: torch.nn.Module,
     output_path: str,
@@ -477,11 +488,15 @@ def _add_signatures(
 
   prefill_mamba_cache = None
   decode_mamba_cache = None
+  prefill_mamba_masks = None
+  decode_mamba_mask = None
   if pytorch_model.has_mamba_blocks():
     prefill_mamba_cache = mamba_utils.MambaCache.from_model_config(config)
     decode_mamba_cache = mamba_utils.MambaCache.from_model_config(
         config, batch_size=export_config.decode_batch_size
     )
+    prefill_mamba_masks = _build_mamba_mask(prefill_seq_lens)
+    decode_mamba_mask = _build_mamba_mask(1)
   
   def _maybe_add_mamba_to_kwargs(sample_kwargs: Dict, is_prefill: bool = False):
     cache = prefill_mamba_cache if is_prefill else decode_mamba_cache
@@ -505,6 +520,8 @@ def _add_signatures(
       _maybe_add_mamba_to_kwargs(sample_kwargs, is_prefill=True)
       if prefill_masks is not None:
         sample_kwargs['mask'] = prefill_masks[i]
+      if prefill_mamba_masks is not None:
+        sample_kwargs['mamba_mask'] = prefill_mamba_masks[i]
 
       if lora is not None:
         prefill_signature_name += f'_lora_r{lora.get_rank()}'
@@ -550,6 +567,8 @@ def _add_signatures(
       sample_kwargs['mask'] = _build_mask(
           1, kv_cache_max_len, config.causal_mask_value
       )
+    if decode_mamba_mask is not None:
+      sample_kwargs['mamba_mask'] = decode_mamba_mask
     if lora is not None:
       sample_kwargs['lora'] = lora
 
